@@ -1,0 +1,50 @@
+name: Build Vietnamese Windows EXE
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: compnerd/gha-setup-swift@397094e75494a93fa8d81db0268dbc8f5d6cf7c6
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+      - name: Build and check Vietnamese UI
+        run: dotnet run --project windows/CodexAccountSwitcher.UiChecks -c Release
+      - name: Package self-contained Windows x64 EXE
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Verify portable package with isolated synthetic settings
+        shell: pwsh
+        run: |
+          $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $pwd 'windows/artifacts/Codex-Account-Switcher-windows-x64.exe'), '--self-test')
+          $start.UseShellExecute = $false
+          $start.CreateNoWindow = $true
+          $start.Environment['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot"
+          foreach ($name in @('CODEX_SWITCHER_HOST_PATH', 'DOTNET_ROOT', 'SDKROOT', 'SWIFT_ROOT', 'SWIFT_PATH')) { $start.Environment.Remove($name) | Out-Null }
+          $start.Environment['CODEX_SWITCHER_SELF_TEST_RESULT'] = Join-Path $pwd 'windows/artifacts/package-self-test.txt'
+          $process = [Diagnostics.Process]::Start($start)
+          if (-not $process.WaitForExit(45000) -or $process.ExitCode -ne 0) { throw 'Self-contained package check failed.' }
+          Get-Content windows/artifacts/package-self-test.txt
+      - name: Upload Vietnamese EXE and SHA256
+        uses: actions/upload-artifact@v4
+        with:
+          name: Codex-Account-Switcher-VI-windows-x64
+          path: |
+            windows/artifacts/*.exe
+            windows/artifacts/*.sha256
+            windows/artifacts/package-self-test.txt
+          if-no-files-found: error
+      - name: Upload UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vietnamese-UI-checks
+          path: windows/artifacts/ui/*.png
+          if-no-files-found: ignore

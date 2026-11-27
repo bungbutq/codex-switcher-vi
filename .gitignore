@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+.DS_Store
+*.xcodeproj/
+DerivedData/
+.env
+env.txt
+.venv/
+.secrets/
+windows/**/bin/
+windows/**/obj/
+windows/artifacts/

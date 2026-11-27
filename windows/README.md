@@ -1,0 +1,75 @@
+# Codex Account Switcher for Windows
+
+Windows is the native WPF window application in this repository, released alongside macOS under one version. Both macOS and Windows use the **same Swift `SwitcherCore`** for accounts, login, switching, settings, usage, cache and recovery. The C# project contains presentation DTOs, a private stdio transport and Windows system adapters; it does not implement account policy. See [shared-core design](../docs/shared-core.md).
+
+The Windows application keeps the macOS account flow and uses Microsoft WPF Fluent controls with a Windows command bar, selected-list indicator, native checkboxes and standard dialog buttons.
+
+## Interface
+
+The compact window follows the existing macOS account flow:
+
+- Account rows show email, reset time, remaining usage, available rate-limit resets, and a saved login snapshot of the subscription active-until date. Missing dates appear as Unknown; hovering shows when the login snapshot was last checked. The date is not a live billing or renewal query. Email titles stay on one line with ellipsis and reveal the full address on hover; accounts without email use their saved name. Select a row, then confirm to switch.
+- Manage Accounts uses the same email titles and contains browser sign-in, register current login and removal of inactive accounts. The browser sign-in hint sits to the right of Add Account on one line.
+- Settings take effect immediately: launch at login, tray tooltip percentage, optional 5-hour usage and language.
+- Usage refreshes at startup, when opening the window, and every five minutes. Failed refreshes retain the last good value.
+- Updates are checked hourly against the signed Windows update feed when enabled. Choosing Update downloads the verified EXE, checks its ECDSA P-256 signature and SHA-256 digest, swaps the binary atomically, and relaunches automatically (falling back to the release page if the installation folder is read-only).
+
+The app opens a centered Windows window with a standard title bar, minimize and close controls, and a taskbar entry. It stays visible when focus moves to another app or the browser. When tray percentage is enabled and usage is available, the tray icon itself shows the selected usage window's remaining percentage as a number; the hover tooltip includes the account name and `%` value. Otherwise the tray uses the original transparent logo. The icon follows the taskbar theme independently of the app theme. It is an additional entry point; reopening the EXE brings the existing window forward. The title-bar Close button hides the window while the tray icon and background work remain active. Left-click the tray icon to reopen the window; right-click it and choose Quit to exit. Active account operations must finish before quitting.
+
+## Shared logic and native boundaries
+
+`Sources/SwitcherCore` owns the ordered handoff: close Desktop, verify/save current login, activate target, verify target, commit selection and reopen Desktop. A verification/commit failure performs the same bounded recovery on both platforms.
+
+macOS calls the module directly through its SwiftUI model. Windows starts a bundled `SwitcherHost.exe` child and receives presentation snapshots. Credentials never cross that UI protocol. Windows adapters implement file ACLs/atomic replacement, Desktop discovery and close/open, browser opening, tray and startup integration.
+
+Desktop is located from the `OpenAI.Codex` Store manifest (its executable can be `ChatGPT.exe`) and common per-user installation paths. Each close/open rediscovers the installation; matching uses the stable Store application identity or the full executable path. After the user confirms switching, Windows forcibly terminates the matched Desktop processes and their descendants, then waits up to 30 seconds for exit before changing credentials. This works for background, minimized and tray-hidden processes without activating windows or simulating keyboard input. Child processes such as Desktop's app-server are included; independently started CLI sessions and same-named executables at unrelated paths remain running. Inspection, termination or exit-wait failures stop the switch before credentials change.
+
+The Windows confirmation explains that forced termination interrupts running tasks and may lose unsaved state. Finish or stop Desktop tasks before switching. macOS retains its normal quit flow.
+
+## Storage
+
+| Purpose | Location |
+| --- | --- |
+| Accounts, settings and usage cache | `%LOCALAPPDATA%\Codex Account Switcher\` |
+| Saved credentials | `accounts\<uuid>\auth.json` below that directory |
+| Active Codex home | `CODEX_HOME`, otherwise `%USERPROFILE%\.codex` |
+| Bundled Swift runtime cache | `%LOCALAPPDATA%\Codex Account Switcher Runtime\<payload-hash>\` |
+
+Both Desktop and Switcher must use the same active Codex home. Saved file credentials are protected by a current-user ACL. Windows credential writes use a private temporary file, flush and same-directory replacement. Symbolic links and junctions in credential paths are rejected. Settings and startup integration remain local.
+
+## Develop
+
+Install [Swift for Windows](https://www.swift.org/install/windows/) and its C++/Windows SDK dependencies, plus the [.NET 10 SDK](https://learn.microsoft.com/en-us/dotnet/core/install/windows).
+
+```powershell
+swift test
+swift build -c release --product SwitcherHost
+$bin = swift build -c release --show-bin-path
+dotnet run --project windows/CodexAccountSwitcher.Checks -c Release -- "$bin/SwitcherHost.exe"
+dotnet run --project windows/CodexAccountSwitcher.UiChecks -c Release
+$env:CODEX_SWITCHER_HOST_PATH = "$bin/SwitcherHost.exe"
+dotnet run --project windows/CodexAccountSwitcher -c Release
+```
+
+The native integration checks use a fresh temporary active home and storage directory. UI checks use fictional presentation data. Neither test operates the user's Desktop or actual credentials.
+
+Run the isolated process-termination regression checks on Windows:
+
+```powershell
+dotnet build windows/CodexAccountSwitcher.CloseFixture -c Release
+dotnet run --project windows/CodexAccountSwitcher.Checks -c Release -- desktop-close "$pwd/windows/CodexAccountSwitcher.CloseFixture/bin/Release/net10.0-windows/ChatGPT.exe"
+```
+
+The fixture hides on window close. Checks cover visible, background, tray-hidden, minimized, headless and unresponsive processes, child/grandchild termination, independent CLI and same-name process isolation, pre-cancellation and Store path rediscovery. Process termination does not depend on an unlocked desktop or foreground input. Fixtures never terminate the user's actual Codex process or change real credentials.
+
+## Package and release
+
+Build with `./scripts/package-windows.ps1`. The downloadable artifact is a portable, self-contained `Codex-Account-Switcher-windows-x64.exe`, including .NET and the Swift host/runtime. End users do not need either SDK. A private toolchain's runtime directory can be supplied with `-SwiftRuntimeDirectory`; a private .NET SDK can be supplied with `-Dotnet`.
+
+The EXE's `--self-test` mode validates its bundled host against an isolated temporary Codex home. CI runs it with SDK/runtime paths removed. The EXE is unsigned and is not an installer.
+
+Windows versions come from `windows/Directory.Build.props` and must match the macOS version sources. A single `v<major>.<minor>.<patch>` tag tests and builds both platforms, then publishes their packages together. See [release management](../docs/platform-releases.md). Windows 0.1.11 preview requires one manual upgrade to enter the unified update channel.
+
+Each release rebuilds and tests both platforms from the same tag, then publishes one Latest release containing the DMG, EXE, and checksums. The MVP does not reuse previous packages or build caches across runs. Local packaging alone does not publish a release.
+
+Icon resources can be regenerated from the existing artwork with `python scripts/generate-windows-icons.py` (Pillow required). Application artwork and transparent tray artwork are packaged separately.

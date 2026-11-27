@@ -1,0 +1,107 @@
+using System.Security.AccessControl;
+using CodexAccountSwitcher.Checks;
+using CodexAccountSwitcher.Core;
+
+if (args.FirstOrDefault() == "app-server") {
+    await RpcFixture.RunAsync();
+    return 0;
+}
+
+CheckSupport.Require(CoreClient.IsSafeSignInURL(new Uri("https://auth.openai.com/login")), "HTTPS sign-in must be accepted.");
+CheckSupport.Require(CoreClient.IsSafeSignInURL(new Uri("http://localhost:1455/callback")), "Loopback localhost HTTP callback must be accepted.");
+CheckSupport.Require(CoreClient.IsSafeSignInURL(new Uri("http://127.0.0.1:1455/callback")), "Loopback IPv4 HTTP callback must be accepted.");
+CheckSupport.Require(CoreClient.IsSafeSignInURL(new Uri("http://[::1]:1455/callback")), "Loopback IPv6 HTTP callback must be accepted.");
+CheckSupport.Require(!CoreClient.IsSafeSignInURL(new Uri("http://example.com/login")), "Remote plain-HTTP sign-in must be rejected.");
+CheckSupport.Require(!CoreClient.IsSafeSignInURL(new Uri("file:///C:/Windows/System32/cmd.exe")), "File URI sign-in must be rejected.");
+
+if (args.FirstOrDefault() is "desktop-close" or "desktop-close-fixture") {
+    var fixture = args.ElementAtOrDefault(1);
+    if (string.IsNullOrWhiteSpace(fixture) || !File.Exists(fixture)) {
+        Console.Error.WriteLine("Pass the built ChatGPT.exe desktop fixture path to run the isolated close and update check.");
+        return 1;
+    }
+    return await DesktopCloseChecks.RunAsync(fixture, verifyInstalledPackage: args[0] == "desktop-close");
+}
+
+if (args.FirstOrDefault() == "host-exit") {
+    var exitedHost = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "where.exe");
+    await using var client = new CoreClient(exitedHost, Path.GetTempPath());
+    try {
+        await client.InitializeAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        throw new Exception("An exited host must fail a pending command.");
+    }
+    catch (Exception ex) when (ex is IOException or OperationCanceledException) { }
+    Console.WriteLine("PASS: an exited host completes pending commands with a failure.");
+    return 0;
+}
+
+if (args.FirstOrDefault() == "runtime-cache") {
+    var runtimeRoot = Path.Combine(Path.GetTempPath(), "switcher-runtime-check-" + Guid.NewGuid());
+    using var payload = new MemoryStream();
+    using (var zip = new System.IO.Compression.ZipArchive(payload, System.IO.Compression.ZipArchiveMode.Create, true)) {
+        foreach (var name in new[] { "SwitcherHost.exe", "runtime.dll" }) {
+            using var writer = new StreamWriter(zip.CreateEntry(name).Open());
+            writer.Write("trusted " + name);
+        }
+    }
+    var archive = payload.ToArray();
+    try {
+        var runtimeHost = HostRuntime.EnsureExtracted(new MemoryStream(archive), runtimeRoot);
+        var timestamp = File.GetLastWriteTimeUtc(runtimeHost);
+        CheckSupport.Require(HostRuntime.EnsureExtracted(new MemoryStream(archive), runtimeRoot) == runtimeHost, "Warm extraction must reuse the content directory.");
+        CheckSupport.Require(File.GetLastWriteTimeUtc(runtimeHost) == timestamp, "A valid runtime must not be rewritten.");
+        File.WriteAllText(runtimeHost, "tampered host");
+        var library = Path.Combine(Path.GetDirectoryName(runtimeHost)!, "runtime.dll");
+        File.Delete(library);
+        HostRuntime.EnsureExtracted(new MemoryStream(archive), runtimeRoot);
+        CheckSupport.Require(File.ReadAllText(runtimeHost) == "trusted SwitcherHost.exe", "A modified host must be repaired.");
+        CheckSupport.Require(File.ReadAllText(library) == "trusted runtime.dll", "A missing runtime library must be restored.");
+        Console.WriteLine("PASS: warm runtime reuse, tamper repair, and missing library recovery.");
+        return 0;
+    }
+    finally { SecureFiles.DeleteOwnedDirectory(Path.GetTempPath(), runtimeRoot); }
+}
+
+if (args.FirstOrDefault() == "windows-update") {
+    return await UpdateChecks.RunAsync();
+}
+
+var host = args.FirstOrDefault() ?? Environment.GetEnvironmentVariable("CODEX_SWITCHER_HOST_PATH");
+if (string.IsNullOrEmpty(host) || !File.Exists(host)) {
+    Console.Error.WriteLine("Pass the built SwitcherHost.exe path to run native/shared-core integration checks.");
+    return 1;
+}
+var root = Path.Combine(Path.GetTempPath(), "switcher-host-check-" + Guid.NewGuid());
+var data = Path.Combine(root, "data");
+var active = Path.Combine(root, "active");
+Directory.CreateDirectory(active);
+try {
+    await using (var client = new CoreClient(Path.GetFullPath(host), data, active)) {
+        await client.InitializeAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        await CheckSupport.UntilAsync(() => client.State.Strings?.ContainsKey("manage") == true, timeoutSeconds: 5);
+        CheckSupport.Require(client.State.Accounts.Length == 0, "Isolated startup should have no accounts.");
+        CheckSupport.Require(client.State.Settings.StatusBarUsageWindow == "fiveHour", "Five-hour usage should be the default tray window.");
+        await client.CommandAsync("language", language: "simplifiedChinese");
+        await client.CommandAsync("fiveHour", value: true);
+        await client.CommandAsync("percentage", value: false);
+        await client.CommandAsync("statusBarUsageWindow", language: "weekly");
+        await CheckSupport.UntilAsync(() => client.State.Settings.ShowsFiveHourUsage && !client.State.Settings.ShowsMenuBarPercentage
+            && client.State.Settings.StatusBarUsageWindow == "weekly", timeoutSeconds: 5);
+        CheckSupport.Require(client.State.Text("manage") == "管理账号", "The native UI must receive shared localization.");
+        CheckSupport.Require(File.Exists(Path.Combine(data, "settings.json")), "Settings should be saved by Swift.");
+        CheckSupport.Require(!File.Exists(Path.Combine(active, "auth.json")), "Settings must not create active credentials.");
+        var acl = new FileInfo(Path.Combine(data, "settings.json")).GetAccessControl();
+        CheckSupport.Require(acl.AreAccessRulesProtected, "Shared-core settings must have a private Windows ACL.");
+        CheckSupport.Require(acl.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)).Count == 1,
+            "Shared-core files must grant only the current user access.");
+    }
+    await using (var second = new CoreClient(Path.GetFullPath(host), data, active)) {
+        await second.InitializeAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        await CheckSupport.UntilAsync(() => second.State.Settings.Language == "simplifiedChinese", timeoutSeconds: 5);
+        CheckSupport.Require(second.State.Settings.ShowsFiveHourUsage, "Settings must survive a host restart.");
+        CheckSupport.Require(second.State.Settings.StatusBarUsageWindow == "weekly", "Tray usage selection must survive a host restart.");
+    }
+    Console.WriteLine("PASS: native transport, shared snapshots/localization, immediate settings, private ACL and restart persistence.");
+    return 0;
+} catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+finally { SecureFiles.DeleteOwnedDirectory(Path.GetTempPath(), root); }

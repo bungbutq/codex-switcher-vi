@@ -1,0 +1,40 @@
+<Application x:Class="CodexAccountSwitcher.App"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" ShutdownMode="OnExplicitShutdown" ThemeMode="Dark">
+ <Application.Resources>
+  <SolidColorBrush x:Key="Surface" Color="#202226"/>
+  <SolidColorBrush x:Key="ListSurface" Color="#2B2D32"/>
+  <SolidColorBrush x:Key="Ink" Color="#F5F5F5"/>
+  <SolidColorBrush x:Key="Muted" Color="#BEBEBE"/>
+  <SolidColorBrush x:Key="Line" Color="#44474D"/>
+  <SolidColorBrush x:Key="Accent" Color="#60CDFF"/>
+  <SolidColorBrush x:Key="Selected" Color="#293F50"/>
+  <SolidColorBrush x:Key="Hover" Color="#15FFFFFF"/>
+  <SolidColorBrush x:Key="Warning" Color="#FFB74D"/>
+  <SolidColorBrush x:Key="ActiveGreen" Color="#49D88A"/>
+  <SolidColorBrush x:Key="ActiveSurface" Color="#233B30"/>
+  <SolidColorBrush x:Key="UsageLow" Color="#EF7777"/>
+  <Style TargetType="Window">
+   <Setter Property="FontFamily" Value="Segoe UI, Microsoft YaHei UI"/>
+   <Setter Property="FontSize" Value="13"/>
+   <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
+  </Style>
+  <Style TargetType="TextBlock"><Setter Property="Foreground" Value="{DynamicResource Ink}"/></Style>
+  <!-- Only account rows have a custom template. Commands and settings use Microsoft's Fluent controls. -->
+  <Style x:Key="AccountRow" TargetType="Button">
+   <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+   <Setter Property="Padding" Value="16,12"/>
+   <Setter Property="Background" Value="Transparent"/>
+   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+    <Border x:Name="Row" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+     <ContentPresenter/>
+    </Border>
+    <ControlTemplate.Triggers>
+     <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource Hover}"/></Trigger>
+     <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Row" Property="BorderBrush" Value="{DynamicResource Accent}"/><Setter TargetName="Row" Property="BorderThickness" Value="1"/></Trigger>
+     <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger>
+    </ControlTemplate.Triggers>
+   </ControlTemplate></Setter.Value></Setter>
+  </Style>
+ </Application.Resources>
+</Application>

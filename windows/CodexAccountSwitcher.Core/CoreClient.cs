@@ -1,0 +1,163 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+
+namespace CodexAccountSwitcher.Core;
+
+/// Thin stdio transport to the exact Swift core used by macOS.
+public sealed class CoreClient : IAccountClient, IAsyncDisposable
+{
+    private readonly Process process;
+    private readonly SynchronizationContext context;
+    private readonly SemaphoreSlim writeLock = new(1);
+    private readonly ConcurrentDictionary<int, TaskCompletionSource> pending = new();
+    private readonly CancellationTokenSource lifetime = new();
+    private readonly Task reader;
+    private readonly Task stderr;
+    private readonly DesktopController desktop = new(ct => DesktopController.DiscoverAsync(ct), allowMissingInstallation: true);
+    private int nextID;
+    private int disposing;
+    public AccountSnapshot State { get; private set; } = AccountSnapshot.Empty;
+    public event Action? Changed;
+    public event Action<string, string>? LowUsage;
+
+    public CoreClient(string hostPath, string dataPath, string? activeHome = null)
+    {
+        context = SynchronizationContext.Current ?? new SynchronizationContext();
+        var start = new ProcessStartInfo(hostPath) {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+            StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = Encoding.UTF8,
+            WorkingDirectory = Path.GetDirectoryName(hostPath)!
+        };
+        start.Environment["CODEX_SWITCHER_DATA_HOME"] = dataPath;
+        if (activeHome != null) start.Environment["CODEX_HOME"] = activeHome;
+        start.Environment["PATH"] = Path.GetDirectoryName(hostPath) + ";" + Environment.GetEnvironmentVariable("PATH");
+        process = Process.Start(start) ?? throw new IOException("The shared account core could not start.");
+        stderr = Task.Run(async () => {
+            var buffer = new char[2048];
+            while (await process.StandardError.ReadAsync(buffer.AsMemory(), lifetime.Token) > 0) { }
+        });
+        reader = ReadAsync();
+    }
+
+    public Task InitializeAsync() => SendAsync(new { command = "initialize" });
+    public Task CommandAsync(string command, Guid? accountID = null, bool? value = null, string? language = null,
+        Guid? targetAccountID = null)
+        => SendAsync(new { command, accountID, value, language, targetAccountID });
+
+    public Task SetAccountNoteAsync(Guid accountID, string note)
+        => SendAsync(new { command = "setAccountNote", accountID, note });
+
+    public Task SetLowUsageThresholdAsync(int? threshold)
+        => SendAsync(new { command = "lowUsageThreshold", lowUsageThreshold = threshold });
+
+    private async Task SendAsync(object command)
+    {
+        var id = Interlocked.Increment(ref nextID);
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[id] = completion;
+        try {
+            var message = JsonSerializer.SerializeToNode(command)!.AsObject();
+            message["id"] = id;
+            await WriteAsync(message);
+            await completion.Task.WaitAsync(lifetime.Token);
+        } finally { pending.TryRemove(id, out _); }
+    }
+
+    private async Task WriteAsync(object message)
+    {
+        await writeLock.WaitAsync(lifetime.Token);
+        try {
+            if (Volatile.Read(ref disposing) != 0 || process.HasExited)
+                throw new IOException("The shared account core stopped.");
+            await process.StandardInput.WriteLineAsync(JsonSerializer.Serialize(message).AsMemory(), lifetime.Token);
+            await process.StandardInput.FlushAsync(lifetime.Token);
+        } finally { writeLock.Release(); }
+    }
+
+    private async Task ReadAsync()
+    {
+        Exception failure = new IOException("The shared account core stopped.");
+        try {
+            while (await process.StandardOutput.ReadLineAsync(lifetime.Token) is { } line) {
+                using var document = JsonDocument.Parse(line);
+                var message = document.RootElement;
+                switch (message.GetProperty("kind").GetString()) {
+                    case "snapshot":
+                        var state = message.GetProperty("state").Deserialize<AccountSnapshot>(AccountSnapshot.JsonOptions)
+                            ?? throw new IOException("Invalid account state.");
+                        context.Post(_ => {
+                            if (state.Strings == null || state.Strings.Count == 0)
+                                state = state with { Strings = State.Strings };
+                            State = state;
+                            Changed?.Invoke();
+                        }, null);
+                        break;
+                    case "lowUsage":
+                        var title = message.GetProperty("title").GetString() ?? throw new IOException("Missing notification title.");
+                        var text = message.GetProperty("message").GetString() ?? throw new IOException("Missing notification message.");
+                        context.Post(_ => LowUsage?.Invoke(title, text), null);
+                        break;
+                    case "completed":
+                        if (pending.TryRemove(message.GetProperty("id").GetInt32(), out var completion)) {
+                            if (message.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.String) completion.TrySetException(new IOException(error.GetString()));
+                            else completion.TrySetResult();
+                        }
+                        break;
+                    case "platform":
+                        _ = HandlePlatformAsync(message.Clone());
+                        break;
+                    case "protocolError": throw new IOException("The shared core protocol failed.");
+                }
+            }
+        } catch (Exception ex) { failure = ex; }
+        finally {
+            foreach (var completion in pending.Values) completion.TrySetException(failure);
+            if (!lifetime.IsCancellationRequested)
+                context.Post(_ => { State = State with { Error = failure.Message }; Changed?.Invoke(); }, null);
+            lifetime.Cancel();
+        }
+    }
+
+    private async Task HandlePlatformAsync(JsonElement message)
+    {
+        string? error = null;
+        try {
+            switch (message.GetProperty("method").GetString()) {
+                case "openBrowser":
+                    var url = new Uri(message.GetProperty("url").GetString()!);
+                    if (!IsSafeSignInURL(url)) throw new IOException("Invalid sign-in address.");
+                    using (Process.Start(new ProcessStartInfo(url.AbsoluteUri) { UseShellExecute = true })) { }
+                    break;
+                case "closeDesktop":
+                    await desktop.CloseAsync(lifetime.Token);
+                    break;
+                case "reopenDesktop":
+                    await desktop.OpenAsync(lifetime.Token);
+                    break;
+                default: throw new IOException("Unknown platform operation.");
+            }
+        } catch (Exception ex) { error = ex.Message; }
+        try { await WriteAsync(new { command = "platformReply", id = message.GetProperty("id").GetInt32(), error }); }
+        catch (Exception) when (lifetime.IsCancellationRequested || process.HasExited) { }
+    }
+
+    internal static bool IsSafeSignInURL(Uri url) =>
+        url.IsAbsoluteUri && !string.IsNullOrEmpty(url.Host) &&
+        (url.Scheme == Uri.UriSchemeHttps || (url.Scheme == Uri.UriSchemeHttp && url.IsLoopback));
+
+    public async ValueTask DisposeAsync()
+    {
+        Interlocked.Exchange(ref disposing, 1);
+        lifetime.Cancel();
+        await writeLock.WaitAsync();
+        try { process.StandardInput.Close(); }
+        finally { writeLock.Release(); }
+        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+        catch (TimeoutException) { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+        try { await Task.WhenAll(reader, stderr); } catch (OperationCanceledException) { }
+        process.Dispose(); lifetime.Dispose(); writeLock.Dispose();
+    }
+}
