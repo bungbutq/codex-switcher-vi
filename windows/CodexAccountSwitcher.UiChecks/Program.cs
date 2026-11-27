@@ -73,8 +73,8 @@ internal static class Program
                 }
             }
             Render(window, Path.Combine(output, "accounts-vi.png"));
-            Assert(Math.Abs(window.ActualWidth - 510) < 2 && window.ActualHeight <= window.MaxHeight + 2,
-                $"Home must be a 510 DIP window (actual {window.ActualWidth} × {window.ActualHeight}).");
+            Assert(Math.Abs(window.ActualWidth - Math.Min(570, SystemParameters.WorkArea.Width - 24)) < 2 && window.ActualHeight <= window.MaxHeight + 2,
+                $"Home must fit the 570 DIP layout to the work area (actual {window.ActualWidth} × {window.ActualHeight}).");
             Assert(window.ShowInTaskbar && !window.Topmost && window.WindowStyle == WindowStyle.SingleBorderWindow,
                 "Windows must use a normal titled window visible in the taskbar.");
             var other = new Window { Width = 100, Height = 100, ShowInTaskbar = false };
@@ -100,6 +100,51 @@ internal static class Program
             Assert(All<TextBlock>(window).Any(text => text.Text == "Lượt reset còn lại: 2"), "Home shows the reported reset count beneath usage.");
             Assert(All<TextBlock>(window).Any(text => text.Text == "Lượt reset còn lại: Chưa rõ"), "Missing reset count must not be shown as zero.");
             var savedState = client.State;
+            // Synthetic snapshots only: no real credentials or network calls.
+            var timerNow = simulatedNow;
+            var first = savedState.Accounts[0];
+            var second = savedState.Accounts[1];
+            client.State = savedState with { Accounts = [
+                first with { Usage = new Usage(0, timerNow.AddDays(2).AddHours(3), 0, timerNow.AddMinutes(3).AddSeconds(24), 2) },
+                second with { Usage = new Usage(70, timerNow.AddDays(2), 0, timerNow.AddMinutes(3).AddSeconds(24), 1) }
+            ] };
+            window.RefreshIfVisible(); window.UpdateLayout();
+            TextBlock[] Timers() => All<TextBlock>(window).Where(t => System.Windows.Automation.AutomationProperties.GetName(t) == "reset-countdown").ToArray();
+            TextBlock[] TimerLabels() => All<TextBlock>(window).Where(t => System.Windows.Automation.AutomationProperties.GetName(t) == "reset-countdown-window").ToArray();
+            Assert(Timers().Length == 2 && Timers().All(t => t.FontSize >= 24 && t.FontWeight == FontWeights.Bold), "Countdowns must be large and bold.");
+            Assert(Timers()[0].Text == "2n 03g\n0p00s" && TimerLabels()[0].Text == "Reset 7 ngày", "Exhausted weekly limit takes precedence even if five-hour limit is also exhausted.");
+            Assert(Timers()[1].Text == "3p24s" && TimerLabels()[1].Text == "Reset 5 giờ", "Exhausted five-hour limit must show its own reset.");
+            simulatedNow = timerNow.AddSeconds(1);
+            var tickFrame = new DispatcherFrame();
+            var tickWait = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1300) };
+            tickWait.Tick += (_, _) => { tickWait.Stop(); tickFrame.Continue = false; };
+            tickWait.Start(); Dispatcher.PushFrame(tickFrame);
+            Assert(Timers()[1].Text == "3p23s", "The countdown must update without a usage refresh.");
+            simulatedNow = timerNow.AddMinutes(4);
+            window.RefreshIfVisible(); window.UpdateLayout();
+            Assert(Timers()[1].Text == "0p00s" && TimerLabels()[1].Text == "Chờ xác nhận", "An expired reset must not fabricate restored usage.");
+            simulatedNow = timerNow;
+            client.State = savedState with { Accounts = [
+                first with { Usage = new Usage(0, timerNow.AddDays(1), 90, timerNow.AddMinutes(2)) },
+                second with { Usage = new Usage(70, timerNow.AddDays(2), 50, timerNow.AddMinutes(3).AddSeconds(24)) }
+            ] };
+            window.RefreshIfVisible(); window.UpdateLayout();
+            Assert(TimerLabels()[0].Text == "Reset 7 ngày" && TimerLabels()[1].Text == "Reset 5 giờ", "Weekly exhaustion and nearest normal reset must select the correct limit.");
+            for (var columns = 2; columns <= 3; columns++) {
+                All<Button>(window).Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == $"Hiển thị {columns} cột").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                window.UpdateLayout();
+                Assert(All<System.Windows.Controls.Primitives.UniformGrid>(window).Any(g => g.Columns == columns && g.Children.Count == 2), "The column selector must change the account grid.");
+                Render(window, Path.Combine(output, $"accounts-{columns}-columns-vi.png"));
+            }
+            client.State = savedState with { Accounts = Enumerable.Range(0, 30).Select(i => first with { Profile = first.Profile with { Id = Guid.NewGuid(), Email = $"test{i}@example.test" } }).ToArray() };
+            window.RefreshIfVisible(); window.UpdateLayout();
+            var listScroll = All<ScrollViewer>(window).First(v => v.Content is StackPanel);
+            Assert(listScroll.ScrollableHeight > 0, "Many accounts must scroll vertically instead of extending the window.");
+            listScroll.ScrollToEnd(); window.UpdateLayout();
+            Assert(listScroll.VerticalOffset > 0 && All<Button>(window).Any(b => System.Windows.Automation.AutomationProperties.GetName(b) == "Hiển thị 1 cột" && b.IsVisible), "Layout controls must stay available when scrolling.");
+            All<Button>(window).Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == "Hiển thị 1 cột").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            client.State = savedState;
+            window.RefreshIfVisible(); window.UpdateLayout();
             client.State = savedState with { Accounts = savedState.Accounts.Select(row => row with { Usage = null }).ToArray() };
             window.RefreshIfVisible(); window.UpdateLayout();
             Assert(All<TextBlock>(window).Count(text => text.Text == "Lượt reset còn lại: Chưa rõ") == 2,

@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -21,6 +22,9 @@ public sealed class MainWindow : Window
     private readonly string dataPath;
     private readonly Func<DateTimeOffset> clock;
     private readonly DispatcherTimer stalenessTimer;
+    private readonly DispatcherTimer countdownTimer;
+    private readonly List<(TextBlock Value, TextBlock Caption, Usage? Usage)> countdowns = [];
+    private int accountColumns = 1;
     private readonly List<ComboBox> activeComboBoxes = [];
     private ScrollViewer? scrollViewer;
     private string page = "accounts";
@@ -54,21 +58,26 @@ public sealed class MainWindow : Window
         this.clock = clock ?? (() => DateTimeOffset.UtcNow);
         stalenessTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
         stalenessTimer.Tick += (_, _) => RefreshIfVisible();
+        countdownTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        countdownTimer.Tick += (_, _) => UpdateCountdowns();
         Icon = System.Windows.Media.Imaging.BitmapFrame.Create(App.IconUri);
-        Title = "Codex Account Switcher – Tiếng Việt"; Width = 510; SizeToContent = SizeToContent.Height;
+        Title = "Codex Account Switcher – Tiếng Việt"; Width = Math.Min(570, SystemParameters.WorkArea.Width - 24); SizeToContent = SizeToContent.Height;
         WindowStyle = WindowStyle.SingleBorderWindow; ResizeMode = ResizeMode.CanMinimize;
         Background = B("Surface"); ShowInTaskbar = true;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         MaxHeight = SystemParameters.WorkArea.Height - 24;
         client.Changed += OnExternalChanged; this.native.Changed += OnExternalChanged;
-        IsVisibleChanged += (_, _) => { if (IsVisible) stalenessTimer.Start(); else stalenessTimer.Stop(); };
+        IsVisibleChanged += (_, _) => {
+            if (IsVisible) { stalenessTimer.Start(); countdownTimer.Start(); UpdateCountdowns(); }
+            else { stalenessTimer.Stop(); countdownTimer.Stop(); }
+        };
         PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape && !IsBusy && page != "accounts") { Navigate(page is "remove" or "note" ? "manage" : "accounts"); e.Handled = true; } };
         Closing += (_, e) => {
             if (closingForExit) return;
             e.Cancel = true;
             Hide();
         };
-        Closed += (_, _) => { stalenessTimer.Stop(); client.Changed -= OnExternalChanged; this.native.Changed -= OnExternalChanged; };
+        Closed += (_, _) => { stalenessTimer.Stop(); countdownTimer.Stop(); client.Changed -= OnExternalChanged; this.native.Changed -= OnExternalChanged; };
         Render();
     }
 
@@ -127,7 +136,9 @@ public sealed class MainWindow : Window
     {
         var previousOffset = preserveScroll ? scrollViewer?.VerticalOffset ?? 0 : 0;
         activeComboBoxes.Clear();
+        countdowns.Clear();
         var body = new StackPanel();
+        UIElement? pinnedHeader = null;
         if (State.Error != null || localError != null) {
             var message = Text(localError ?? State.Error!, 11, muted: true); message.TextWrapping = TextWrapping.Wrap;
             var box = Pair(message, Button("×", () => { localError = null; _ = Run("dismissError"); Render(preserveScroll: true); }));
@@ -136,6 +147,20 @@ public sealed class MainWindow : Window
         if (page == "accounts") {
             var commands = new StackPanel { Orientation = Orientation.Horizontal };
             commands.Children.Add(Button(T("manage"), () => Navigate("manage"), "\uE716"));
+            for (var i = 1; i <= 3; i++) {
+                var columns = i;
+                var layoutButton = Button(i.ToString(CultureInfo.InvariantCulture), () => SetAccountColumns(columns));
+                layoutButton.Padding = new Thickness(6, 5, 6, 5);
+                layoutButton.MinWidth = 28;
+                layoutButton.Margin = new Thickness(i == 1 ? 8 : 2, 0, 0, 0);
+                layoutButton.ToolTip = $"Hiển thị {i} cột";
+                AutomationProperties.SetName(layoutButton, $"Hiển thị {i} cột");
+                if (i == accountColumns) {
+                    layoutButton.Background = B("ActiveSurface");
+                    layoutButton.BorderBrush = B("ActiveGreen");
+                }
+                commands.Children.Add(layoutButton);
+            }
             var refresh = Button("", RefreshUsage, "\uE72C");
             refresh.Margin = new Thickness(8, 0, 0, 0);
             refresh.ToolTip = T("refresh");
@@ -147,7 +172,7 @@ public sealed class MainWindow : Window
             AutomationProperties.SetName(settings, T("settings"));
             commands.Children.Add(settings);
             var heading = Pair(Text(T("accounts"), 20, bold: true), commands);
-            heading.Margin = new Thickness(20, 16, 20, 16); body.Children.Add(heading);
+            heading.Margin = new Thickness(20, 16, 20, 16); pinnedHeader = heading;
         } else {
             var header = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(20, 16, 20, 16) };
             header.Children.Add(Button("", () => Navigate(page is "remove" or "note" ? "manage" : "accounts"), "\uE72B"));
@@ -172,7 +197,93 @@ public sealed class MainWindow : Window
             viewer.Loaded += (_, _) => viewer.ScrollToVerticalOffset(previousOffset);
         }
         scrollViewer = viewer;
-        Content = new Border { Background = B("Surface"), Child = viewer };
+        var root = new DockPanel { LastChildFill = true };
+        if (pinnedHeader != null) {
+            DockPanel.SetDock(pinnedHeader, Dock.Top);
+            root.Children.Add(pinnedHeader);
+        }
+        root.Children.Add(viewer);
+        Content = new Border { Background = B("Surface"), Child = root };
+        UpdateCountdowns();
+    }
+
+    private void SetAccountColumns(int columns)
+    {
+        if (columns == accountColumns) return;
+        accountColumns = Math.Clamp(columns, 1, 3);
+        var work = SystemParameters.WorkArea;
+        Width = Math.Min(570 + 530 * (accountColumns - 1), work.Width - 24);
+        if (IsVisible) {
+            Left = Math.Max(work.Left, Math.Min(Left, work.Right - Width));
+        }
+        Render(preserveScroll: false);
+    }
+
+    private void UpdateCountdowns()
+    {
+        var now = clock();
+        foreach (var (value, caption, usage) in countdowns) {
+            value.ToolTip = null;
+            if (usage == null) {
+                value.Text = "—";
+                value.Foreground = B("Muted");
+                caption.Text = "Chờ đồng bộ";
+                continue;
+            }
+            // The weekly limit blocks use even when the five-hour limit remains.
+            DateTimeOffset? reset;
+            string window;
+            bool blocked = usage.RemainingPercent <= 0 || usage.FiveHourRemainingPercent is <= 0;
+            if (usage.RemainingPercent <= 0) {
+                reset = usage.ResetsAt; window = "7 ngày";
+            } else if (usage.FiveHourRemainingPercent is <= 0) {
+                reset = usage.FiveHourResetsAt; window = "5 giờ";
+            } else if (usage.FiveHourResetsAt is { } five &&
+                       five > now && (usage.ResetsAt <= now || five <= usage.ResetsAt)) {
+                reset = five; window = "5 giờ";
+            } else if (usage.ResetsAt > now) {
+                reset = usage.ResetsAt; window = "7 ngày";
+            } else {
+                reset = usage.FiveHourResetsAt ?? usage.ResetsAt;
+                window = usage.FiveHourResetsAt.HasValue ? "5 giờ" : "7 ngày";
+            }
+            caption.Text = "Reset " + window;
+            value.Foreground = B(blocked ? "Warning" : "ActiveGreen");
+            if (reset == null) { value.Text = "—"; caption.Text = "Chưa có mốc"; continue; }
+            var seconds = (long)Math.Ceiling((reset.Value - now).TotalSeconds);
+            if (seconds <= 0) {
+                value.Text = "0p00s";
+                caption.Text = "Chờ xác nhận";
+                value.Foreground = B("Muted");
+                continue;
+            }
+            var time = TimeSpan.FromSeconds(seconds);
+            var shortTime = $"{time.Minutes}p{time.Seconds:00}s";
+            value.Text = time.Days > 0 ? $"{time.Days}n {time.Hours:00}g\n{shortTime}" :
+                         time.Hours > 0 ? $"{time.Hours}g\n{shortTime}" : shortTime;
+            value.ToolTip = $"Reset {window}: {reset.Value.ToLocalTime():dd/MM/yyyy HH:mm:ss}";
+        }
+    }
+
+    private UIElement CountdownAvatar(Border avatar, Usage? usage)
+    {
+        var panel = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 8, 4) };
+        panel.Children.Add(avatar);
+        var value = Text("—", 24, bold: true);
+        value.FontWeight = FontWeights.Bold;
+        value.FontFamily = new FontFamily("Consolas, Segoe UI");
+        value.TextAlignment = TextAlignment.Center;
+        value.TextTrimming = TextTrimming.None;
+        value.Margin = new Thickness(0, 5, 0, 2);
+        value.MinHeight = 58;
+        AutomationProperties.SetName(value, "reset-countdown");
+        var caption = Text("Chờ đồng bộ", 10, muted: true);
+        caption.TextAlignment = TextAlignment.Center;
+        AutomationProperties.SetName(caption, "reset-countdown-window");
+        panel.Children.Add(value);
+        panel.Children.Add(caption);
+        countdowns.Add((value, caption, usage));
+        return panel;
     }
 
     private Guid? DraggedAccount(IDataObject data, Guid targetID)
@@ -201,13 +312,14 @@ public sealed class MainWindow : Window
             warning.Children.Add(Text(T("active_unconfirmed"), 11, muted: true));
             warning.Children.Add(Button(T("manage"), () => Navigate("manage"), left: true)); body.Children.Add(warning);
         }
-        var list = new StackPanel();
+        Panel list = manage ? new StackPanel() : new UniformGrid { Columns = accountColumns };
         var canReorder = manage && State.Accounts.Length > 1;
         foreach (var row in State.Accounts) {
             var avatar = new Border { Width = 32, Height = 32, CornerRadius = new CornerRadius(4), Background = B("Hover"),
                 Child = Text(row.Initials, 11, bold: true) };
             ((TextBlock)avatar.Child).HorizontalAlignment = HorizontalAlignment.Center;
             var details = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            UIElement? accountHeader = null;
             var active = State.ActiveIdentityConfirmed && row.Profile.Id == State.ActiveAccountID;
             var title = row.DisplayTitle;
             var name = Text(title, 14, bold: true);
@@ -224,7 +336,7 @@ public sealed class MainWindow : Window
                 if (active && switchButton.Content is StackPanel activeContent) {
                     foreach (var label in activeContent.Children.OfType<TextBlock>()) label.Foreground = B("ActiveGreen");
                 }
-                details.Children.Add(Pair(name, switchButton));
+                accountHeader = Pair(name, switchButton);
                 var usage = row.Usage;
                 details.Children.Add(UsageLine(T("five_hour"), usage?.FiveHourRemainingPercent, usage?.FiveHourResetsAt));
                 details.Children.Add(UsageLine(T("weekly"), usage?.RemainingPercent, usage?.ResetsAt));
@@ -243,11 +355,26 @@ public sealed class MainWindow : Window
             if (row.Profile.LabeledEmail is { } email) {
                 var address = Text(email, 11, muted: true);
                 address.ToolTip = email;
-                details.Children.Insert(1, address);
+                if (manage) details.Children.Insert(1, address);
+                else if (accountHeader != null) {
+                    var fullHeader = new StackPanel();
+                    fullHeader.Children.Add(accountHeader);
+                    fullHeader.Children.Add(address);
+                    accountHeader = fullHeader;
+                }
             }
             var grid = new Grid { MinHeight = manage ? 32 : 50 };
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44) }); grid.ColumnDefinitions.Add(new ColumnDefinition());
-            grid.Children.Add(avatar); Grid.SetColumn(details, 1); grid.Children.Add(details);
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(manage ? 44 : 120) }); grid.ColumnDefinitions.Add(new ColumnDefinition());
+            if (manage) grid.Children.Add(avatar);
+            else grid.Children.Add(CountdownAvatar(avatar, row.Usage));
+            Grid.SetColumn(details, 1); grid.Children.Add(details);
+            if (!manage && accountHeader != null) {
+                var content = new StackPanel();
+                content.Children.Add(accountHeader);
+                content.Children.Add(grid);
+                grid = new Grid();
+                grid.Children.Add(content);
+            }
             if (manage) {
                 grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 UIElement action = row.Profile.Id == State.ActiveAccountID ? Text(active ? T("active") : T("account_unconfirmed"), 11, muted: true) : Button("", () => { target = row; page = "remove"; Render(); }, "\uE74D");
@@ -305,7 +432,7 @@ public sealed class MainWindow : Window
                 var selection = new Border { Width = 5, Background = active ? B("ActiveGreen") : Brushes.Transparent,
                     HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Stretch, IsHitTestVisible = false };
                 AutomationProperties.SetName(selection, active ? "active-indicator" : "inactive-indicator");
-                var rowContainer = new Grid { Margin = new Thickness(0, 0, 0, 8) };
+                var rowContainer = new Grid { Margin = new Thickness(0, 0, accountColumns > 1 ? 8 : 0, 8) };
                 rowContainer.Children.Add(card); rowContainer.Children.Add(selection);
                 list.Children.Add(rowContainer);
             }
